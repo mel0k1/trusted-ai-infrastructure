@@ -30,11 +30,11 @@
 | Крейт | Назначение |
 |---|---|
 | [`tai-core`](crates/tai-core) | общие типы событий |
-| [`tai-policy`](crates/tai-policy) | policy engine: правила allow/deny с wildcard, deny важнее allow, default deny, hot-reload из файла |
+| [`tai-policy`](crates/tai-policy) | policy engine: правила allow/deny с wildcard, deny важнее allow, default deny, hot-reload из файла или по HTTP |
 | [`tai-models`](crates/tai-models) | роутер моделей: sync + async (tokio), SSE-стриминг, фолбэк, таймауты |
 | [`tai-sandbox`](crates/tai-sandbox) | sandbox инструментов: белый список, таймауты, лимиты вывода и параллелизма |
 | [`tai-agents`](crates/tai-agents) | гейт агента: sync и async агенты, действия проходят через policy, результаты пишутся в аудит |
-| [`tai-audit`](crates/tai-audit) | JSONL аудит-лог с хэш-цепочкой SHA-256 и внешним якорением (файл / HTTP) |
+| [`tai-audit`](crates/tai-audit) | JSONL аудит-лог с хэш-цепочкой SHA-256 и внешним якорением (файл / HTTP / RFC-3161 TSA) |
 
 ## Быстрый старт
 
@@ -62,15 +62,17 @@ assert!(!policy.check("research-1", "tool.call", "fs.write:/etc/passwd").is_allo
 
 ### Горячая перезагрузка
 
-`HotPolicy` следит за JSON-файлом и атомарно подменяет живую политику. Битый файл никогда не заменит рабочую политику — ошибка возвращается наружу, старые правила продолжают работать.
+`HotPolicy` следит за источником и атомарно подменяет живую политику. Битый файл никогда не заменит рабочую политику — ошибка возвращается наружу, старые правила продолжают работать. Источники: `PolicySource::File` или `PolicySource::Http` — политику можно вести централизованно и забирать по HTTP(S):
 
 ```rust
 use std::sync::Arc;
 use std::time::Duration;
 use tai_policy::HotPolicy;
 
+// локальный файл или удалённый конфиг-сервер — один и тот же API
 let hot = HotPolicy::new("policy.json")?;
-let watcher = hot.spawn_watcher(Duration::from_secs(5));
+let hot = HotPolicy::http("https://config.example.com/policies/agents.json")?;
+let watcher = hot.spawn_watcher(Duration::from_secs(30));
 
 // всегда свежий снапшот, проверка без блокировки через Arc
 let decision = hot.check("agent-1", "tool.call", "web.get:x");
@@ -78,6 +80,8 @@ let decision = hot.check("agent-1", "tool.call", "web.get:x");
 hot.stop();
 watcher.join().unwrap();
 ```
+
+Сбой сети или парсинга при перезагрузке возвращается как ошибка, а работающие правила не трогаются.
 
 ## Роутер моделей
 
@@ -215,16 +219,38 @@ tai_audit::verify_with_anchor("audit.jsonl", "audit.anchor.jsonl")?; // Ok(())
 {"height":200,"head":"fc14...","ts":1791123410,"prev":"c2ef...","hash":"63a9..."}
 ```
 
+### RFC-3161 таймстампы
+
+Файловый и HTTP-якоря всё ещё под вашим контролем. `Rfc3161Anchor` вместо этого отдаёт голову цепочки независимому Time Stamp Authority: каждый чекпоинт штампуется RFC-3161 токеном, сырой ответ `.tsr` сохраняется для офлайн-проверки. Работает с любым TSA (freetsa.org, DigiCert, свой):
+
+```rust
+use tai_audit::{AuditLog, Rfc3161Anchor};
+
+let anchor = Rfc3161Anchor::new("http://freetsa.org/tsr", "tsa");
+let audit = AuditLog::file_anchored("audit.jsonl", Box::new(anchor), 100)?;
+// каждые 100 событий -> голова лога штампуется TSA, ответ лежит в tsa/{height}.tsr
+
+// цепочка цела + отпечаток каждого токена совпадает с головой лога на его высоте
+let stamped = tai_audit::verify_tsr_dir("audit.jsonl", "tsa")?;
+```
+
+Токены можно проверять и через openssl (`tsa.crt` — цепочка сертификатов вашего TSA-провайдера):
+
+```bash
+openssl ts -reply -in tsa/200.tsr -text
+openssl ts -verify -digest <хэш-головы> -in tsa/200.tsr -CAfile tsa.crt
+```
+
 ## Дорожная карта
 
 - [x] sandbox для инструментов: белый список с лимитами выполнения
 - [x] async API на tokio
 - [x] хэш-цепочка в аудит-логе (защита от подделки)
 - [x] стриминг completions (SSE)
-- [x] горячая перезагрузка политик
-- [x] внешнее якорение (файл / HTTP)
-- [ ] RFC-3161 таймстампы для чекпоинтов
-- [ ] hot-reload политик из удалённых источников
+- [x] горячая перезагрузка политик (файл / HTTP)
+- [x] внешнее якорение: файл, HTTP, RFC-3161 таймстампы
+- [ ] офлайн-проверка цепочки сертификатов TSA
+- [ ] источники политик: git, object storage
 
 ## Лицензия
 

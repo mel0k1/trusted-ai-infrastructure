@@ -30,11 +30,11 @@ Every agent action goes through a policy check first, and every decision — all
 | Crate | What it does |
 |---|---|
 | [`tai-core`](crates/tai-core) | shared event types |
-| [`tai-policy`](crates/tai-policy) | policy engine: allow/deny rules with wildcards, deny overrides, default deny, hot-reload from file |
+| [`tai-policy`](crates/tai-policy) | policy engine: allow/deny rules with wildcards, deny overrides, default deny, hot-reload from file or HTTP |
 | [`tai-models`](crates/tai-models) | model router: sync + async (tokio), SSE streaming, fallback, timeouts |
 | [`tai-sandbox`](crates/tai-sandbox) | tool sandbox: whitelist, timeouts, output and concurrency limits |
 | [`tai-agents`](crates/tai-agents) | agent gate: sync and async agents, actions pass policy, results are audited |
-| [`tai-audit`](crates/tai-audit) | JSONL audit log with SHA-256 hash chain and external anchoring (file / HTTP) |
+| [`tai-audit`](crates/tai-audit) | JSONL audit log with SHA-256 hash chain and external anchoring (file / HTTP / RFC-3161 TSA) |
 
 ## Quick start
 
@@ -62,15 +62,17 @@ assert!(!policy.check("research-1", "tool.call", "fs.write:/etc/passwd").is_allo
 
 ### Hot-reload
 
-`HotPolicy` watches a JSON file and swaps the live policy atomically. A malformed file never replaces the working policy — the error is reported and the old rules keep running.
+`HotPolicy` watches a source and swaps the live policy atomically. A malformed file never replaces the working policy — the error is reported and the old rules keep running. Sources are `PolicySource::File` or `PolicySource::Http`, so policy can be managed centrally and pulled over HTTP(S):
 
 ```rust
 use std::sync::Arc;
 use std::time::Duration;
 use tai_policy::HotPolicy;
 
+// local file or remote config server — same API
 let hot = HotPolicy::new("policy.json")?;
-let watcher = hot.spawn_watcher(Duration::from_secs(5));
+let hot = HotPolicy::http("https://config.example.com/policies/agents.json")?;
+let watcher = hot.spawn_watcher(Duration::from_secs(30));
 
 // always a fresh snapshot, lock-free checks on the Arc
 let decision = hot.check("agent-1", "tool.call", "web.get:x");
@@ -78,6 +80,8 @@ let decision = hot.check("agent-1", "tool.call", "web.get:x");
 hot.stop();
 watcher.join().unwrap();
 ```
+
+A network or parse failure during reload is reported, and the running rules stay untouched.
 
 ## Model router
 
@@ -215,16 +219,38 @@ A checkpoint line:
 {"height":200,"head":"fc14...","ts":1791123410,"prev":"c2ef...","hash":"63a9..."}
 ```
 
+### RFC-3161 timestamps
+
+File and HTTP anchors are still under your control. `Rfc3161Anchor` hands the chain head to an independent Time Stamp Authority instead: every checkpoint is stamped with an RFC-3161 token, and the raw `.tsr` response is stored for offline verification. Works with any TSA (freetsa.org, DigiCert, your own):
+
+```rust
+use tai_audit::{AuditLog, Rfc3161Anchor};
+
+let anchor = Rfc3161Anchor::new("http://freetsa.org/tsr", "tsa");
+let audit = AuditLog::file_anchored("audit.jsonl", Box::new(anchor), 100)?;
+// every 100 events -> head hash stamped by the TSA, saved as tsa/{height}.tsr
+
+// chain intact + every token imprint matches the log head at its height
+let stamped = tai_audit::verify_tsr_dir("audit.jsonl", "tsa")?;
+```
+
+Tokens can also be checked with openssl (`tsa.crt` — the certificate chain of your TSA provider):
+
+```bash
+openssl ts -reply -in tsa/200.tsr -text
+openssl ts -verify -digest <head-hash> -in tsa/200.tsr -CAfile tsa.crt
+```
+
 ## Roadmap
 
 - [x] tool sandbox: whitelisted tools with execution limits
 - [x] async API on tokio
 - [x] hash-chained audit log (tamper evidence)
 - [x] streaming completions (SSE)
-- [x] policy hot-reload
-- [x] external anchoring (file / HTTP)
-- [ ] RFC-3161 timestamping for checkpoints
-- [ ] policy hot-reload from remote sources
+- [x] policy hot-reload (file / HTTP)
+- [x] external anchoring: file, HTTP, RFC-3161 timestamps
+- [ ] offline TSA certificate-chain verification
+- [ ] policy sources: git, object storage
 
 ## License
 
