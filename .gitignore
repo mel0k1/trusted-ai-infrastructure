@@ -2,3 +2,4 @@
 **/*.rs.bk
 Cargo.lock.orig
 /audit.jsonl
+/audit.anchor.jsonl
