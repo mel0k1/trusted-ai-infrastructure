@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use tai_audit::AuditLog;
 use tai_core::Event;
-use tai_models::{AsyncRouter, CompletionRequest, ModelError, Router};
+use tai_models::{AsyncRouter, CompletionRequest, DeltaSink, ModelError, Router};
 use tai_policy::{Decision, Policy};
 use tai_sandbox::{Sandbox, ToolError};
 use thiserror::Error;
@@ -138,6 +138,31 @@ impl AsyncAgent {
         Ok(resp.text)
     }
 
+    /// Стриминг ответа модели через гейт; дельты в sink.
+    pub async fn ask_stream(
+        &self,
+        prompt: &str,
+        on_delta: &mut dyn DeltaSink,
+    ) -> Result<String, AgentError> {
+        gate(
+            &self.policy,
+            &self.id,
+            "model.invoke",
+            "model:*",
+            &self.audit,
+        )?;
+        let resp = self
+            .router
+            .stream(&CompletionRequest::new(prompt), on_delta)
+            .await?;
+        self.audit.log(&Event::now(
+            "model.invoke",
+            &self.id,
+            format!("model={} len={} stream=true", resp.model, resp.text.len()),
+        ));
+        Ok(resp.text)
+    }
+
     /// Инструмент: policy на {tool}:{input}, затем sandbox.
     pub async fn call_tool(&self, name: &str, input: &str) -> Result<String, AgentError> {
         gate(
@@ -239,6 +264,25 @@ mod tests {
         assert!(matches!(
             a.call_tool("nope", "x").await,
             Err(AgentError::Tool(ToolError::NotFound(_)))
+        ));
+    }
+
+    #[tokio::test]
+    async fn async_agent_streams_through_gate() {
+        let a = async_agent(Policy::new().allow("a", "model.invoke", "model:*"));
+        let mut seen = String::new();
+        let text = a
+            .ask_stream("hi", &mut |d: &str| seen.push_str(d))
+            .await
+            .unwrap();
+        assert_eq!(text, "hi");
+        // echo без стриминга — дельт нет
+        assert!(seen.is_empty());
+
+        let b = async_agent(Policy::new());
+        assert!(matches!(
+            b.ask_stream("hi", &mut |d: &str| seen.push_str(d)).await,
+            Err(AgentError::Denied(_))
         ));
     }
 }
