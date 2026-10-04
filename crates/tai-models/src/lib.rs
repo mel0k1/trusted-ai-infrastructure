@@ -232,10 +232,32 @@ where
     }
 }
 
+/// Приёмник дельт стрима; реализован для любых FnMut(&str) + Send.
+pub trait DeltaSink: Send {
+    fn on_delta(&mut self, delta: &str);
+}
+
+impl<F: FnMut(&str) + Send> DeltaSink for F {
+    fn on_delta(&mut self, delta: &str) {
+        self(delta);
+    }
+}
+
 #[async_trait]
 pub trait AsyncModel: Send + Sync {
     fn id(&self) -> &str;
     async fn complete(&self, req: &CompletionRequest) -> Result<CompletionResponse, ModelError>;
+
+    /// SSE-стрим: дельты в sink, возврат — полный текст.
+    /// Дефолт: без дельт, просто complete.
+    async fn stream(
+        &self,
+        req: &CompletionRequest,
+        _on_delta: &mut dyn DeltaSink,
+    ) -> Result<String, ModelError> {
+        let resp = self.complete(req).await?;
+        Ok(resp.text)
+    }
 }
 
 #[async_trait]
@@ -342,6 +364,69 @@ impl AsyncModel for AsyncOpenAiCompat {
             text,
         })
     }
+
+    async fn stream(
+        &self,
+        req: &CompletionRequest,
+        on_delta: &mut dyn DeltaSink,
+    ) -> Result<String, ModelError> {
+        let body = serde_json::json!({
+            "model": self.model,
+            "messages": [{ "role": "user", "content": req.prompt }],
+            "max_tokens": req.max_tokens.unwrap_or(1024),
+            "stream": true,
+        });
+
+        let mut request = self
+            .http
+            .post(format!("{}/chat/completions", self.base_url))
+            .json(&body);
+        if let Some(key) = &self.api_key {
+            request = request.bearer_auth(key);
+        }
+
+        let mut resp = request
+            .send()
+            .await
+            .map_err(|e| ModelError::Network(e.to_string()))?;
+        let status = resp.status();
+        if !status.is_success() {
+            let message = resp.text().await.unwrap_or_default();
+            return Err(ModelError::Api {
+                status: status.as_u16(),
+                message,
+            });
+        }
+
+        let mut buf = String::new();
+        let mut full = String::new();
+        while let Some(chunk) = resp
+            .chunk()
+            .await
+            .map_err(|e| ModelError::Network(e.to_string()))?
+        {
+            // JSON обычно ASCII-экранирован, lossy на границе чанка ок
+            buf.push_str(&String::from_utf8_lossy(&chunk));
+            while let Some(pos) = buf.find('\n') {
+                let line: String = buf.drain(..=pos).collect();
+                if let Some(data) = line.trim().strip_prefix("data:") {
+                    let data = data.trim();
+                    if data == "[DONE]" {
+                        return Ok(full);
+                    }
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(data) {
+                        if let Some(delta) = v["choices"][0]["delta"]["content"].as_str() {
+                            if !delta.is_empty() {
+                                on_delta.on_delta(delta);
+                                full.push_str(delta);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(full)
+    }
 }
 
 /// Мост: синхронная модель в async через spawn_blocking.
@@ -409,6 +494,40 @@ impl AsyncRouter {
             match attempt {
                 Ok(resp) => return Ok(resp),
                 Err(e) => last = Some(e),
+            }
+        }
+        Err(last.expect("models is not empty"))
+    }
+
+    /// Стрим с фолбэком: переход к следующей модели только пока дельты не пошли.
+    pub async fn stream(
+        &self,
+        req: &CompletionRequest,
+        on_delta: &mut dyn DeltaSink,
+    ) -> Result<CompletionResponse, ModelError> {
+        if self.models.is_empty() {
+            return Err(ModelError::Empty);
+        }
+        let mut last: Option<ModelError> = None;
+        for model in &self.models {
+            let emitted = std::sync::atomic::AtomicBool::new(false);
+            let mut wrapped = |d: &str| {
+                emitted.store(true, std::sync::atomic::Ordering::Relaxed);
+                on_delta.on_delta(d);
+            };
+            match model.stream(req, &mut wrapped).await {
+                Ok(text) => {
+                    return Ok(CompletionResponse {
+                        model: model.id().to_string(),
+                        text,
+                    });
+                }
+                Err(e) => {
+                    if emitted.load(std::sync::atomic::Ordering::Relaxed) {
+                        return Err(e);
+                    }
+                    last = Some(e);
+                }
             }
         }
         Err(last.expect("models is not empty"))
@@ -571,5 +690,94 @@ mod tests {
         let m = AsyncOpenAiCompat::new("main", "http://127.0.0.1:1/v1", "test-model");
         let err = m.complete(&CompletionRequest::new("hi")).await.unwrap_err();
         assert!(matches!(err, ModelError::Network(_)));
+    }
+
+    struct EmitThenFail;
+
+    #[async_trait]
+    impl AsyncModel for EmitThenFail {
+        fn id(&self) -> &str {
+            "emit-fail"
+        }
+
+        async fn complete(&self, _: &CompletionRequest) -> Result<CompletionResponse, ModelError> {
+            Err(ModelError::Network("down".into()))
+        }
+
+        async fn stream(
+            &self,
+            _: &CompletionRequest,
+            on_delta: &mut dyn DeltaSink,
+        ) -> Result<String, ModelError> {
+            on_delta.on_delta("part");
+            Err(ModelError::Network("mid-stream".into()))
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_reads_sse_deltas() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 4096];
+            let _ = sock.read(&mut buf).await;
+            let body = "data: {\"choices\":[{\"delta\":{\"content\":\"he\"}}]}\n\n\
+                        data: {\"choices\":[{\"delta\":{\"content\":\"llo\"}}]}\n\n\
+                        data: [DONE]\n\n";
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            sock.write_all(resp.as_bytes()).await.unwrap();
+        });
+
+        let m = AsyncOpenAiCompat::new("main", format!("http://{addr}/v1"), "m");
+        let mut seen = String::new();
+        let text = m
+            .stream(&CompletionRequest::new("hi"), &mut |d: &str| {
+                seen.push_str(d)
+            })
+            .await
+            .unwrap();
+        server.await.unwrap();
+        assert_eq!(text, "hello");
+        assert_eq!(seen, "hello");
+    }
+
+    #[tokio::test]
+    async fn stream_falls_back_before_first_delta() {
+        let router = AsyncRouter::new()
+            .register(Arc::new(AsyncFail))
+            .register_sync(Arc::new(Echo::new("echo")));
+        let mut seen = String::new();
+        let resp = router
+            .stream(&CompletionRequest::new("hi"), &mut |d: &str| {
+                seen.push_str(d)
+            })
+            .await
+            .unwrap();
+        assert_eq!(resp.model, "echo");
+        assert_eq!(resp.text, "hi");
+        assert!(seen.is_empty());
+    }
+
+    #[tokio::test]
+    async fn stream_error_after_deltas_is_fatal() {
+        let router = AsyncRouter::new()
+            .register(Arc::new(EmitThenFail))
+            .register_sync(Arc::new(Echo::new("echo")));
+        let mut seen = String::new();
+        let err = router
+            .stream(&CompletionRequest::new("hi"), &mut |d: &str| {
+                seen.push_str(d)
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ModelError::Network(_)));
+        assert_eq!(seen, "part");
     }
 }
