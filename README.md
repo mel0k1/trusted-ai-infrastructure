@@ -3,7 +3,7 @@
 [![CI](https://github.com/mel0k1/trusted-ai-infrastructure/actions/workflows/ci.yml/badge.svg)](https://github.com/mel0k1/trusted-ai-infrastructure/actions/workflows/ci.yml)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
-Trust layer for AI systems. Model routing, agent gates, permissions and audit — small composable Rust crates with a deny-by-default posture.
+Trust layer for AI systems. Model routing, agent gates, permissions, tool sandbox and audit — small composable Rust crates with a deny-by-default posture. Sync and async (tokio) APIs.
 
 English | [Русский](README.ru.md)
 
@@ -23,7 +23,7 @@ English | [Русский](README.ru.md)
                     Audit / Events
 ```
 
-Every agent action goes through a policy check first, and every decision — allow or deny — lands in the audit log. Nothing is allowed unless a rule says so.
+Every agent action goes through a policy check first, and every decision — allow or deny — lands in a hash-chained audit log. Nothing is allowed unless a rule says so.
 
 ## Crates
 
@@ -31,9 +31,10 @@ Every agent action goes through a policy check first, and every decision — all
 |---|---|
 | [`tai-core`](crates/tai-core) | shared event types |
 | [`tai-policy`](crates/tai-policy) | policy engine: allow/deny rules with wildcards, deny overrides, default deny |
-| [`tai-models`](crates/tai-models) | model router: one interface for local and API models, fallback, timeouts |
-| [`tai-agents`](crates/tai-agents) | agent gate: actions pass policy, results are audited |
-| [`tai-audit`](crates/tai-audit) | JSONL audit log: file, stderr or any writer |
+| [`tai-models`](crates/tai-models) | model router: sync + async (tokio), one interface for local/API models, fallback, timeouts |
+| [`tai-sandbox`](crates/tai-sandbox) | tool sandbox: whitelist, timeouts, output and concurrency limits |
+| [`tai-agents`](crates/tai-agents) | agent gate: sync and async agents, actions pass policy, results are audited |
+| [`tai-audit`](crates/tai-audit) | JSONL audit log with SHA-256 hash chain (tamper-evident) |
 
 ## Quick start
 
@@ -74,6 +75,8 @@ Policies can be stored as JSON:
 
 Any OpenAI-compatible endpoint works: OpenAI, Ollama (`/v1`), vLLM, llama.cpp. The router tries models in order and falls back on failure; an optional timeout guards each attempt.
 
+Sync:
+
 ```rust
 use std::sync::Arc;
 use std::time::Duration;
@@ -93,41 +96,109 @@ let router = Router::new()
 let answer = router.complete(&CompletionRequest::new("ping")).unwrap();
 ```
 
-## Agents
-
-An agent binds a router, a policy and an audit log. Every action is gated and audited:
+Async on tokio — sync models run on the blocking pool via `register_sync`:
 
 ```rust
 use std::sync::Arc;
-use tai_agents::Agent;
-use tai_audit::AuditLog;
-use tai_models::{Echo, Router};
-use tai_policy::Policy;
+use std::time::Duration;
+use tai_models::{AsyncOpenAiCompat, AsyncRouter, CompletionRequest, Echo};
 
-let agent = Agent::new(
-    "assistant-1",
-    Arc::new(Router::new().register(Arc::new(Echo::new("echo")))),
-    Arc::new(Policy::new().allow("assistant-1", "model.invoke", "model:*")),
-    Arc::new(AuditLog::stderr()),
-);
+#[tokio::main]
+async fn main() {
+    let api = Arc::new(
+        AsyncOpenAiCompat::new("main", "http://localhost:11434/v1", "qwen2.5:7b")
+            .timeout(Duration::from_secs(30)),
+    );
+    let fallback = Arc::new(Echo::new("local-echo"));
 
-agent.ask("hello").unwrap(); // allowed, audited
-agent.ensure_allowed("tool.call", "fs.write:/etc").unwrap_err(); // denied, audited
+    let router = AsyncRouter::new()
+        .with_timeout(Duration::from_secs(60))
+        .register(api)
+        .register_sync(fallback);
+
+    let answer = router.complete(&CompletionRequest::new("ping")).await.unwrap();
+}
 ```
 
-Audit output is JSONL — one event per line:
+## Tool sandbox
+
+Tools are whitelisted and capped by timeout, output size and concurrency; oversized output is truncated on char boundaries. Custom tools implement the async `Tool` trait.
+
+```rust
+use std::sync::Arc;
+use std::time::Duration;
+use tai_sandbox::{EchoTool, Limits, Sandbox};
+
+let sandbox = Sandbox::new(Limits {
+    timeout: Duration::from_secs(5),
+    max_output: 16 * 1024,
+    max_concurrent: 4,
+})
+.register(Arc::new(EchoTool));
+
+assert_eq!(sandbox.execute("echo", "ping").await.unwrap(), "ping");
+assert!(matches!(
+    sandbox.execute("fs.write", "/etc").await,
+    Err(tai_sandbox::ToolError::NotFound(_))
+));
+```
+
+## Agents
+
+An agent binds a router, a policy, an audit log and (for async) a sandbox. `call_tool` checks `tool.call` on `{tool}:{input}` first, then executes inside the sandbox — denied actions never reach a tool.
+
+```rust
+use std::sync::Arc;
+use tai_agents::AsyncAgent;
+use tai_audit::AuditLog;
+use tai_models::{AsyncRouter, Echo};
+use tai_policy::Policy;
+use tai_sandbox::{EchoTool, Limits, Sandbox};
+
+let agent = AsyncAgent::new(
+    "assistant-1",
+    Arc::new(AsyncRouter::new().register_sync(Arc::new(Echo::new("echo")))),
+    Arc::new(Policy::new()
+        .allow("assistant-1", "model.invoke", "model:*")
+        .allow("assistant-1", "tool.call", "echo:*")),
+    Arc::new(AuditLog::stderr()),
+    Arc::new(Sandbox::new(Limits::default()).register(Arc::new(EchoTool))),
+);
+
+agent.ask("hello").await.unwrap(); // allowed, audited
+agent.call_tool("echo", "ping").await.unwrap(); // gated + sandboxed, audited
+agent.call_tool("fs.write", "/etc").await.unwrap_err(); // default deny
+```
+
+A sync `Agent` with the same gate is also available for non-tokio code.
+
+## Audit
+
+Each JSONL line carries `prev` and `hash` — SHA-256 over the previous hash and the event, anchored to a genesis hash. Reopening the file continues the chain, so verification works across restarts. Any edit to a past line breaks it:
+
+```rust
+use tai_audit::AuditLog;
+
+let audit = AuditLog::file("audit.jsonl")?;
+audit.log(&Event::now("policy.allow", "assistant-1", "tool.call echo:ping"));
+
+tai_audit::verify("audit.jsonl")?; // Ok(()) — chain intact
+```
+
+A line in the log:
 
 ```json
-{"ts":1728000000,"kind":"policy.deny","actor":"assistant-1","detail":"tool.call fs.write:/etc default deny"}
+{"ts":1728000000,"kind":"policy.allow","actor":"assistant-1","detail":"tool.call echo:ping","prev":"000...0","hash":"9f2c..."}
 ```
 
 ## Roadmap
 
-- [ ] tool sandbox: whitelisted tools with execution limits
-- [ ] hash-chained audit log (tamper evidence)
+- [x] tool sandbox: whitelisted tools with execution limits
+- [x] async API on tokio
+- [x] hash-chained audit log (tamper evidence)
 - [ ] streaming completions
-- [ ] async API on tokio
 - [ ] policy hot-reload
+- [ ] external anchoring for the audit chain
 
 ## License
 
