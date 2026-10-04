@@ -3,7 +3,7 @@
 [![CI](https://github.com/mel0k1/trusted-ai-infrastructure/actions/workflows/ci.yml/badge.svg)](https://github.com/mel0k1/trusted-ai-infrastructure/actions/workflows/ci.yml)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
-Trust layer for AI systems. Model routing, agent gates, permissions, tool sandbox and audit — small composable Rust crates with a deny-by-default posture. Sync and async (tokio) APIs.
+Trust layer for AI systems. Model routing with streaming, agent gates, permissions, tool sandbox and tamper-evident audit — small composable Rust crates with a deny-by-default posture. Sync and async (tokio) APIs.
 
 English | [Русский](README.ru.md)
 
@@ -30,11 +30,11 @@ Every agent action goes through a policy check first, and every decision — all
 | Crate | What it does |
 |---|---|
 | [`tai-core`](crates/tai-core) | shared event types |
-| [`tai-policy`](crates/tai-policy) | policy engine: allow/deny rules with wildcards, deny overrides, default deny |
-| [`tai-models`](crates/tai-models) | model router: sync + async (tokio), one interface for local/API models, fallback, timeouts |
+| [`tai-policy`](crates/tai-policy) | policy engine: allow/deny rules with wildcards, deny overrides, default deny, hot-reload from file |
+| [`tai-models`](crates/tai-models) | model router: sync + async (tokio), SSE streaming, fallback, timeouts |
 | [`tai-sandbox`](crates/tai-sandbox) | tool sandbox: whitelist, timeouts, output and concurrency limits |
 | [`tai-agents`](crates/tai-agents) | agent gate: sync and async agents, actions pass policy, results are audited |
-| [`tai-audit`](crates/tai-audit) | JSONL audit log with SHA-256 hash chain (tamper-evident) |
+| [`tai-audit`](crates/tai-audit) | JSONL audit log with SHA-256 hash chain and external anchoring (file / HTTP) |
 
 ## Quick start
 
@@ -60,43 +60,28 @@ assert!(policy.check("research-1", "tool.call", "web.get:example.com").is_allowe
 assert!(!policy.check("research-1", "tool.call", "fs.write:/etc/passwd").is_allowed());
 ```
 
-Policies can be stored as JSON:
+### Hot-reload
 
-```json
-{
-  "rules": [
-    { "effect": "allow", "agent": "research-*", "action": "tool.call", "resource": "web.get:*" },
-    { "effect": "deny",  "agent": "*",          "action": "tool.call", "resource": "fs.write:/etc/*" }
-  ]
-}
+`HotPolicy` watches a JSON file and swaps the live policy atomically. A malformed file never replaces the working policy — the error is reported and the old rules keep running.
+
+```rust
+use std::sync::Arc;
+use std::time::Duration;
+use tai_policy::HotPolicy;
+
+let hot = HotPolicy::new("policy.json")?;
+let watcher = hot.spawn_watcher(Duration::from_secs(5));
+
+// always a fresh snapshot, lock-free checks on the Arc
+let decision = hot.check("agent-1", "tool.call", "web.get:x");
+
+hot.stop();
+watcher.join().unwrap();
 ```
 
 ## Model router
 
 Any OpenAI-compatible endpoint works: OpenAI, Ollama (`/v1`), vLLM, llama.cpp. The router tries models in order and falls back on failure; an optional timeout guards each attempt.
-
-Sync:
-
-```rust
-use std::sync::Arc;
-use std::time::Duration;
-use tai_models::{CompletionRequest, Echo, OpenAiCompat, Router};
-
-let api = Arc::new(
-    OpenAiCompat::new("main", "http://localhost:11434/v1", "qwen2.5:7b")
-        .timeout(Duration::from_secs(30)),
-);
-let fallback = Arc::new(Echo::new("local-echo"));
-
-let router = Router::new()
-    .with_timeout(Duration::from_secs(60))
-    .register(api)
-    .register(fallback);
-
-let answer = router.complete(&CompletionRequest::new("ping")).unwrap();
-```
-
-Async on tokio — sync models run on the blocking pool via `register_sync`:
 
 ```rust
 use std::sync::Arc;
@@ -111,6 +96,7 @@ async fn main() {
     );
     let fallback = Arc::new(Echo::new("local-echo"));
 
+    // register_sync runs sync models on the blocking pool
     let router = AsyncRouter::new()
         .with_timeout(Duration::from_secs(60))
         .register(api)
@@ -118,6 +104,30 @@ async fn main() {
 
     let answer = router.complete(&CompletionRequest::new("ping")).await.unwrap();
 }
+```
+
+### Streaming
+
+`stream` parses OpenAI SSE and pushes deltas into a `DeltaSink` (any `FnMut(&str) + Send`). Fallback only happens while no deltas have been emitted — once the stream started, a mid-stream error is fatal instead of duplicating output on the next model.
+
+```rust
+use tai_models::DeltaSink;
+
+let mut full = String::new();
+let resp = router
+    .stream(&CompletionRequest::new("tell me a story"), &mut |d: &str| {
+        print!("{d}");
+        full.push_str(d);
+    })
+    .await
+    .unwrap();
+// resp.text == full
+```
+
+Agents stream through the same gate:
+
+```rust
+let text = agent.ask_stream("hello", &mut |d: &str| print!("{d}")).await.unwrap();
 ```
 
 ## Tool sandbox
@@ -185,10 +195,24 @@ audit.log(&Event::now("policy.allow", "assistant-1", "tool.call echo:ping"));
 tai_audit::verify("audit.jsonl")?; // Ok(()) — chain intact
 ```
 
-A line in the log:
+### External anchoring
+
+A local chain can still be rewritten in full. Checkpoints fix that: every N events the chain head is published to an external `Anchor` (append-only file, HTTP endpoint, SIEM — implement the trait for anything else). The anchor itself is hash-chained, and checkpoints are verified against the log by height:
+
+```rust
+use tai_audit::{AuditLog, FileAnchor};
+
+let anchor = FileAnchor::create("audit.anchor.jsonl");
+let audit = AuditLog::file_anchored("audit.jsonl", Box::new(anchor), 100)?;
+// every 100 events -> Checkpoint { height, head } goes to the anchor file
+
+tai_audit::verify_with_anchor("audit.jsonl", "audit.anchor.jsonl")?; // Ok(())
+```
+
+A checkpoint line:
 
 ```json
-{"ts":1728000000,"kind":"policy.allow","actor":"assistant-1","detail":"tool.call echo:ping","prev":"000...0","hash":"9f2c..."}
+{"height":200,"head":"fc14...","ts":1791123410,"prev":"c2ef...","hash":"63a9..."}
 ```
 
 ## Roadmap
@@ -196,9 +220,11 @@ A line in the log:
 - [x] tool sandbox: whitelisted tools with execution limits
 - [x] async API on tokio
 - [x] hash-chained audit log (tamper evidence)
-- [ ] streaming completions
-- [ ] policy hot-reload
-- [ ] external anchoring for the audit chain
+- [x] streaming completions (SSE)
+- [x] policy hot-reload
+- [x] external anchoring (file / HTTP)
+- [ ] RFC-3161 timestamping for checkpoints
+- [ ] policy hot-reload from remote sources
 
 ## License
 

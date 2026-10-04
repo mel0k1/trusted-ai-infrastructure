@@ -3,7 +3,7 @@
 [![CI](https://github.com/mel0k1/trusted-ai-infrastructure/actions/workflows/ci.yml/badge.svg)](https://github.com/mel0k1/trusted-ai-infrastructure/actions/workflows/ci.yml)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
-Слой доверия для AI-систем: роутинг моделей, гейты агентов, права доступа, sandbox инструментов и аудит — небольшие компонуемые крейты на Rust с политикой «всё запрещено по умолчанию». Sync и async (tokio) API.
+Слой доверия для AI-систем: роутинг моделей со стримингом, гейты агентов, права доступа, sandbox инструментов и аудит с защитой от подделки — небольшие компонуемые крейты на Rust с политикой «всё запрещено по умолчанию». Sync и async (tokio) API.
 
 [English](README.md) | Русский
 
@@ -30,11 +30,11 @@
 | Крейт | Назначение |
 |---|---|
 | [`tai-core`](crates/tai-core) | общие типы событий |
-| [`tai-policy`](crates/tai-policy) | policy engine: правила allow/deny с wildcard, deny важнее allow, default deny |
-| [`tai-models`](crates/tai-models) | роутер моделей: sync + async (tokio), один интерфейс для local и API моделей, фолбэк, таймауты |
+| [`tai-policy`](crates/tai-policy) | policy engine: правила allow/deny с wildcard, deny важнее allow, default deny, hot-reload из файла |
+| [`tai-models`](crates/tai-models) | роутер моделей: sync + async (tokio), SSE-стриминг, фолбэк, таймауты |
 | [`tai-sandbox`](crates/tai-sandbox) | sandbox инструментов: белый список, таймауты, лимиты вывода и параллелизма |
 | [`tai-agents`](crates/tai-agents) | гейт агента: sync и async агенты, действия проходят через policy, результаты пишутся в аудит |
-| [`tai-audit`](crates/tai-audit) | JSONL аудит-лог с хэш-цепочкой SHA-256 (защита от подделки) |
+| [`tai-audit`](crates/tai-audit) | JSONL аудит-лог с хэш-цепочкой SHA-256 и внешним якорением (файл / HTTP) |
 
 ## Быстрый старт
 
@@ -60,43 +60,28 @@ assert!(policy.check("research-1", "tool.call", "web.get:example.com").is_allowe
 assert!(!policy.check("research-1", "tool.call", "fs.write:/etc/passwd").is_allowed());
 ```
 
-Политику можно хранить в JSON:
+### Горячая перезагрузка
 
-```json
-{
-  "rules": [
-    { "effect": "allow", "agent": "research-*", "action": "tool.call", "resource": "web.get:*" },
-    { "effect": "deny",  "agent": "*",          "action": "tool.call", "resource": "fs.write:/etc/*" }
-  ]
-}
+`HotPolicy` следит за JSON-файлом и атомарно подменяет живую политику. Битый файл никогда не заменит рабочую политику — ошибка возвращается наружу, старые правила продолжают работать.
+
+```rust
+use std::sync::Arc;
+use std::time::Duration;
+use tai_policy::HotPolicy;
+
+let hot = HotPolicy::new("policy.json")?;
+let watcher = hot.spawn_watcher(Duration::from_secs(5));
+
+// всегда свежий снапшот, проверка без блокировки через Arc
+let decision = hot.check("agent-1", "tool.call", "web.get:x");
+
+hot.stop();
+watcher.join().unwrap();
 ```
 
 ## Роутер моделей
 
 Подходит любой OpenAI-совместимый эндпоинт: OpenAI, Ollama (`/v1`), vLLM, llama.cpp. Роутер перебирает модели по порядку, при ошибке переходит к следующей; на каждую попытку можно поставить таймаут.
-
-Sync:
-
-```rust
-use std::sync::Arc;
-use std::time::Duration;
-use tai_models::{CompletionRequest, Echo, OpenAiCompat, Router};
-
-let api = Arc::new(
-    OpenAiCompat::new("main", "http://localhost:11434/v1", "qwen2.5:7b")
-        .timeout(Duration::from_secs(30)),
-);
-let fallback = Arc::new(Echo::new("local-echo"));
-
-let router = Router::new()
-    .with_timeout(Duration::from_secs(60))
-    .register(api)
-    .register(fallback);
-
-let answer = router.complete(&CompletionRequest::new("ping")).unwrap();
-```
-
-Async на tokio — sync-модели запускаются через `register_sync` в blocking-пуле:
 
 ```rust
 use std::sync::Arc;
@@ -111,6 +96,7 @@ async fn main() {
     );
     let fallback = Arc::new(Echo::new("local-echo"));
 
+    // register_sync запускает sync-модели в blocking-пуле
     let router = AsyncRouter::new()
         .with_timeout(Duration::from_secs(60))
         .register(api)
@@ -118,6 +104,30 @@ async fn main() {
 
     let answer = router.complete(&CompletionRequest::new("ping")).await.unwrap();
 }
+```
+
+### Стриминг
+
+`stream` парсит OpenAI SSE и отдаёт дельты в `DeltaSink` (любой `FnMut(&str) + Send`). Фолбэк работает только пока дельты не пошли — если стрим уже начался, ошибка посреди стрима фатальна, а не дублирует вывод на следующей модели.
+
+```rust
+use tai_models::DeltaSink;
+
+let mut full = String::new();
+let resp = router
+    .stream(&CompletionRequest::new("tell me a story"), &mut |d: &str| {
+        print!("{d}");
+        full.push_str(d);
+    })
+    .await
+    .unwrap();
+// resp.text == full
+```
+
+Агенты стримят через тот же гейт:
+
+```rust
+let text = agent.ask_stream("hello", &mut |d: &str| print!("{d}")).await.unwrap();
 ```
 
 ## Sandbox инструментов
@@ -185,10 +195,24 @@ audit.log(&Event::now("policy.allow", "assistant-1", "tool.call echo:ping"));
 tai_audit::verify("audit.jsonl")?; // Ok(()) — цепочка цела
 ```
 
-Строка в логе:
+### Внешнее якорение
+
+Локальную цепочку можно переписать целиком. От этого спасают чекпоинты: каждые N событий голова цепочки публикуется во внешний `Anchor` (append-only файл, HTTP-эндпоинт, SIEM — трейт реализуется под что угодно). Якорь сам сцеплен хэшами, а чекпоинты сверяются с логом по высоте:
+
+```rust
+use tai_audit::{AuditLog, FileAnchor};
+
+let anchor = FileAnchor::create("audit.anchor.jsonl");
+let audit = AuditLog::file_anchored("audit.jsonl", Box::new(anchor), 100)?;
+// каждые 100 событий -> Checkpoint { height, head } уходит в файл якоря
+
+tai_audit::verify_with_anchor("audit.jsonl", "audit.anchor.jsonl")?; // Ok(())
+```
+
+Строка чекпоинта:
 
 ```json
-{"ts":1728000000,"kind":"policy.allow","actor":"assistant-1","detail":"tool.call echo:ping","prev":"000...0","hash":"9f2c..."}
+{"height":200,"head":"fc14...","ts":1791123410,"prev":"c2ef...","hash":"63a9..."}
 ```
 
 ## Дорожная карта
@@ -196,9 +220,11 @@ tai_audit::verify("audit.jsonl")?; // Ok(()) — цепочка цела
 - [x] sandbox для инструментов: белый список с лимитами выполнения
 - [x] async API на tokio
 - [x] хэш-цепочка в аудит-логе (защита от подделки)
-- [ ] стриминг completions
-- [ ] горячая перезагрузка политик
-- [ ] внешнее якорение цепочки аудита
+- [x] стриминг completions (SSE)
+- [x] горячая перезагрузка политик
+- [x] внешнее якорение (файл / HTTP)
+- [ ] RFC-3161 таймстампы для чекпоинтов
+- [ ] hot-reload политик из удалённых источников
 
 ## Лицензия
 
