@@ -1,8 +1,9 @@
-//! Модели и роутер: единый интерфейс, фолбэк, таймауты.
+//! Модели и роутер: единый интерфейс, фолбэк, таймауты; sync и async (tokio).
 
 use std::sync::Arc;
 use std::time::Duration;
 
+use async_trait::async_trait;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -231,6 +232,195 @@ where
     }
 }
 
+#[async_trait]
+pub trait AsyncModel: Send + Sync {
+    fn id(&self) -> &str;
+    async fn complete(&self, req: &CompletionRequest) -> Result<CompletionResponse, ModelError>;
+}
+
+#[async_trait]
+impl AsyncModel for Echo {
+    fn id(&self) -> &str {
+        Model::id(self)
+    }
+
+    async fn complete(&self, req: &CompletionRequest) -> Result<CompletionResponse, ModelError> {
+        Model::complete(self, req)
+    }
+}
+
+/// Async-вариант OpenAI-совместимого API на reqwest.
+pub struct AsyncOpenAiCompat {
+    id: String,
+    base_url: String,
+    model: String,
+    api_key: Option<String>,
+    http: reqwest::Client,
+}
+
+impl AsyncOpenAiCompat {
+    pub fn new(
+        id: impl Into<String>,
+        base_url: impl Into<String>,
+        model: impl Into<String>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            base_url: base_url.into().trim_end_matches('/').to_string(),
+            model: model.into(),
+            api_key: None,
+            http: reqwest::Client::builder()
+                .timeout(Duration::from_secs(30))
+                .build()
+                .expect("http client"),
+        }
+    }
+
+    pub fn api_key(mut self, key: impl Into<String>) -> Self {
+        self.api_key = Some(key.into());
+        self
+    }
+
+    pub fn timeout(mut self, t: Duration) -> Self {
+        self.http = reqwest::Client::builder()
+            .timeout(t)
+            .build()
+            .expect("http client");
+        self
+    }
+}
+
+#[async_trait]
+impl AsyncModel for AsyncOpenAiCompat {
+    fn id(&self) -> &str {
+        &self.id
+    }
+
+    async fn complete(&self, req: &CompletionRequest) -> Result<CompletionResponse, ModelError> {
+        let body = serde_json::json!({
+            "model": self.model,
+            "messages": [{ "role": "user", "content": req.prompt }],
+            "max_tokens": req.max_tokens.unwrap_or(1024),
+        });
+
+        let mut request = self
+            .http
+            .post(format!("{}/chat/completions", self.base_url))
+            .json(&body);
+        if let Some(key) = &self.api_key {
+            request = request.bearer_auth(key);
+        }
+
+        let resp = request
+            .send()
+            .await
+            .map_err(|e| ModelError::Network(e.to_string()))?;
+        let status = resp.status();
+        if !status.is_success() {
+            let message = resp.text().await.unwrap_or_default();
+            return Err(ModelError::Api {
+                status: status.as_u16(),
+                message,
+            });
+        }
+
+        let json: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| ModelError::Network(e.to_string()))?;
+
+        let text = json["choices"][0]["message"]["content"]
+            .as_str()
+            .ok_or(ModelError::Api {
+                status: status.as_u16(),
+                message: "missing choices[0].message.content".into(),
+            })?
+            .to_string();
+
+        Ok(CompletionResponse {
+            model: self.id.clone(),
+            text,
+        })
+    }
+}
+
+/// Мост: синхронная модель в async через spawn_blocking.
+pub struct SyncToAsync(pub Arc<dyn Model>);
+
+#[async_trait]
+impl AsyncModel for SyncToAsync {
+    fn id(&self) -> &str {
+        self.0.id()
+    }
+
+    async fn complete(&self, req: &CompletionRequest) -> Result<CompletionResponse, ModelError> {
+        let model = Arc::clone(&self.0);
+        let owned = req.clone();
+        tokio::task::spawn_blocking(move || model.complete(&owned))
+            .await
+            .map_err(|e| ModelError::Network(e.to_string()))?
+    }
+}
+
+/// Async-роутер: перебор моделей с фолбэком и таймаутом на попытку.
+pub struct AsyncRouter {
+    models: Vec<Arc<dyn AsyncModel>>,
+    timeout: Option<Duration>,
+}
+
+impl AsyncRouter {
+    pub fn new() -> Self {
+        Self {
+            models: Vec::new(),
+            timeout: None,
+        }
+    }
+
+    pub fn with_timeout(mut self, t: Duration) -> Self {
+        self.timeout = Some(t);
+        self
+    }
+
+    pub fn register(mut self, model: Arc<dyn AsyncModel>) -> Self {
+        self.models.push(model);
+        self
+    }
+
+    pub fn register_sync(self, model: Arc<dyn Model>) -> Self {
+        self.register(Arc::new(SyncToAsync(model)))
+    }
+
+    pub async fn complete(
+        &self,
+        req: &CompletionRequest,
+    ) -> Result<CompletionResponse, ModelError> {
+        if self.models.is_empty() {
+            return Err(ModelError::Empty);
+        }
+        let mut last: Option<ModelError> = None;
+        for model in &self.models {
+            let attempt = match self.timeout {
+                Some(t) => match tokio::time::timeout(t, model.complete(req)).await {
+                    Ok(r) => r,
+                    Err(_) => Err(ModelError::Timeout(t)),
+                },
+                None => model.complete(req).await,
+            };
+            match attempt {
+                Ok(resp) => return Ok(resp),
+                Err(e) => last = Some(e),
+            }
+        }
+        Err(last.expect("models is not empty"))
+    }
+}
+
+impl Default for AsyncRouter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -310,6 +500,76 @@ mod tests {
         assert_eq!(m.base_url, "http://127.0.0.1:1/v1");
         // сетевой запрос упадёт транспортной ошибкой, а не паникой
         let err = m.complete(&CompletionRequest::new("hi")).unwrap_err();
+        assert!(matches!(err, ModelError::Network(_)));
+    }
+
+    struct AsyncFail;
+
+    #[async_trait]
+    impl AsyncModel for AsyncFail {
+        fn id(&self) -> &str {
+            "failing"
+        }
+
+        async fn complete(&self, _: &CompletionRequest) -> Result<CompletionResponse, ModelError> {
+            Err(ModelError::Network("down".into()))
+        }
+    }
+
+    struct AsyncSlow;
+
+    #[async_trait]
+    impl AsyncModel for AsyncSlow {
+        fn id(&self) -> &str {
+            "slow"
+        }
+
+        async fn complete(&self, _: &CompletionRequest) -> Result<CompletionResponse, ModelError> {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            Ok(CompletionResponse {
+                model: "slow".into(),
+                text: "done".into(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn async_router_falls_back_to_sync_model() {
+        let router = AsyncRouter::new()
+            .register(Arc::new(AsyncFail))
+            .register_sync(Arc::new(Echo::new("echo")));
+        let resp = router
+            .complete(&CompletionRequest::new("hi"))
+            .await
+            .unwrap();
+        assert_eq!(resp.model, "echo");
+        assert_eq!(resp.text, "hi");
+    }
+
+    #[tokio::test]
+    async fn async_router_applies_timeout() {
+        let router = AsyncRouter::new()
+            .with_timeout(Duration::from_millis(50))
+            .register(Arc::new(AsyncSlow));
+        assert!(matches!(
+            router.complete(&CompletionRequest::new("hi")).await,
+            Err(ModelError::Timeout(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn async_empty_router_is_error() {
+        let router = AsyncRouter::new();
+        assert!(matches!(
+            router.complete(&CompletionRequest::new("hi")).await,
+            Err(ModelError::Empty)
+        ));
+    }
+
+    #[tokio::test]
+    async fn async_openai_network_error() {
+        let m = AsyncOpenAiCompat::new("main", "http://127.0.0.1:1/v1", "test-model");
+        let err = m.complete(&CompletionRequest::new("hi")).await.unwrap_err();
         assert!(matches!(err, ModelError::Network(_)));
     }
 }
