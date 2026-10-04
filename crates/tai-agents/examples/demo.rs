@@ -1,41 +1,51 @@
-//! Пример: агент поверх echo-модели с policy и аудитом.
+//! Пример: async-агент с sandbox и хэш-цепочкой аудита.
 //!
 //! cargo run --example demo -p tai-agents
 
 use std::sync::Arc;
+use std::time::Duration;
 
-use tai_agents::Agent;
+use tai_agents::AsyncAgent;
 use tai_audit::AuditLog;
-use tai_models::{Echo, Router};
+use tai_models::{AsyncRouter, Echo};
 use tai_policy::Policy;
+use tai_sandbox::{EchoTool, Limits, Sandbox};
 
-fn main() {
-    // invoke моделей и web.get разрешены, fs.write запрещён явно, остальное — default deny
+#[tokio::main]
+async fn main() {
+    // invoke моделей и echo разрешены, fs.write запрещён явно, остальное — default deny
     let policy = Arc::new(
         Policy::new()
             .allow("demo-agent", "model.invoke", "model:*")
-            .allow("demo-agent", "tool.call", "web.get:*")
+            .allow("demo-agent", "tool.call", "echo:*")
             .deny("demo-agent", "tool.call", "fs.write:*"),
     );
 
-    let router = Arc::new(Router::new().register(Arc::new(Echo::new("local-echo"))));
-    let agent = Agent::new("demo-agent", router, policy, Arc::new(AuditLog::stderr()));
+    let router = Arc::new(
+        AsyncRouter::new()
+            .with_timeout(Duration::from_secs(30))
+            .register_sync(Arc::new(Echo::new("local-echo"))),
+    );
+    let sandbox = Arc::new(
+        Sandbox::new(Limits {
+            timeout: Duration::from_secs(5),
+            max_output: 16 * 1024,
+            max_concurrent: 4,
+        })
+        .register(Arc::new(EchoTool)),
+    );
+    let audit = Arc::new(AuditLog::file("audit.jsonl").expect("audit file"));
 
-    match agent.ask("hello there") {
-        Ok(text) => println!("answer: {text}"),
-        Err(e) => println!("rejected: {e}"),
+    let agent = AsyncAgent::new("demo-agent", router, policy, audit, sandbox);
+
+    println!("answer: {}", agent.ask("hello there").await.unwrap());
+    println!("echo: {}", agent.call_tool("echo", "ping").await.unwrap());
+    if let Err(e) = agent.call_tool("fs.write", "/etc/passwd").await {
+        println!("rejected: {e}");
     }
 
-    println!(
-        "web.get allowed: {}",
-        agent
-            .ensure_allowed("tool.call", "web.get:example.com")
-            .is_ok()
-    );
-    println!(
-        "fs.write allowed: {}",
-        agent
-            .ensure_allowed("tool.call", "fs.write:/etc/passwd")
-            .is_ok()
-    );
+    match tai_audit::verify("audit.jsonl") {
+        Ok(()) => println!("audit chain: ok"),
+        Err(e) => println!("audit chain: {e}"),
+    }
 }
