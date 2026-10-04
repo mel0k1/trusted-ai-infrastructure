@@ -1,6 +1,6 @@
 [package]
 name = "tai-agents"
-description = "Agent gate: every action passes policy and lands in the audit log"
+description = "Agent gate: sync and async agents, every action passes policy and lands in the audit log"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -10,5 +10,9 @@ repository.workspace = true
 tai-core = { path = "../tai-core" }
 tai-models = { path = "../tai-models" }
 tai-policy = { path = "../tai-policy" }
+tai-sandbox = { path = "../tai-sandbox" }
 tai-audit = { path = "../tai-audit" }
 thiserror = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
