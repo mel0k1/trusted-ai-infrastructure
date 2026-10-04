@@ -1,0 +1,12 @@
+[package]
+name = "tai-models"
+description = "Model router: single interface for local/API models with fallback and timeouts"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+ureq = { workspace = true }
