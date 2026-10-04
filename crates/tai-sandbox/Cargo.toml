@@ -1,0 +1,12 @@
+[package]
+name = "tai-sandbox"
+description = "Tool sandbox: whitelist, timeouts, output and concurrency limits"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
