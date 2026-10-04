@@ -1,9 +1,9 @@
 //! Общие типы Trusted AI Infrastructure.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// Событие аудита: единый формат для всех компонентов.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Event {
     /// Unix-время в секундах.
     pub ts: u64,
