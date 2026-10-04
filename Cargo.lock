@@ -918,7 +918,7 @@ dependencies = [
 
 [[package]]
 name = "tai-agents"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "tai-audit",
  "tai-core",
@@ -931,7 +931,7 @@ dependencies = [
 
 [[package]]
 name = "tai-audit"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "hex",
  "serde",
@@ -944,14 +944,14 @@ dependencies = [
 
 [[package]]
 name = "tai-core"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "tai-models"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "reqwest",
@@ -963,16 +963,17 @@ dependencies = [
 
 [[package]]
 name = "tai-policy"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "serde",
  "serde_json",
  "thiserror",
+ "ureq",
 ]
 
 [[package]]
 name = "tai-sandbox"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "thiserror",
