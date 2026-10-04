@@ -1,0 +1,11 @@
+[package]
+name = "tai-audit"
+description = "JSONL audit log: file, stderr or any writer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde_json = { workspace = true }
+tai-core = { path = "../tai-core" }
