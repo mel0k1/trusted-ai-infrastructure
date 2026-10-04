@@ -11,6 +11,10 @@ use sha2::{Digest, Sha256};
 use tai_core::Event;
 use thiserror::Error;
 
+mod rfc3161;
+
+pub use rfc3161::{verify_tsr, verify_tsr_dir, Rfc3161Anchor, TsaError, TstInfo};
+
 /// Хэш первой записи в цепочке.
 pub const GENESIS: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 
@@ -454,9 +458,29 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let handle = std::thread::spawn(move || {
             let (mut sock, _) = listener.accept().unwrap();
-            let mut buf = [0u8; 4096];
-            let n = sock.read(&mut buf).unwrap();
-            let req = String::from_utf8_lossy(&buf[..n]).to_string();
+            // читаем до конца тела по Content-Length: тело может прийти отдельным сегментом
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 4096];
+            loop {
+                let n = sock.read(&mut chunk).unwrap();
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&chunk[..n]);
+                let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") else {
+                    continue;
+                };
+                let headers = String::from_utf8_lossy(&buf[..pos]).to_lowercase();
+                let cl: usize = headers
+                    .split("\r\n")
+                    .find_map(|l| l.strip_prefix("content-length:"))
+                    .map(|v| v.trim().parse().unwrap())
+                    .unwrap_or(0);
+                if buf.len() >= pos + 4 + cl {
+                    break;
+                }
+            }
+            let req = String::from_utf8_lossy(&buf).to_string();
             assert!(req.starts_with("POST /anchor "));
             assert!(req.contains("\"height\":3"));
             sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
