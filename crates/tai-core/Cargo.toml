@@ -1,0 +1,10 @@
+[package]
+name = "tai-core"
+description = "Shared types for Trusted AI Infrastructure"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde = { workspace = true }
