@@ -1,10 +1,18 @@
 //! Policy engine: решает, можно ли агенту выполнить действие над ресурсом.
 
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::Duration;
+
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum PolicyError {
+    #[error("io: {0}")]
+    Io(#[from] std::io::Error),
     #[error("json: {0}")]
     Json(#[from] serde_json::Error),
 }
@@ -111,6 +119,66 @@ impl Policy {
     }
 }
 
+/// Политика с горячей перезагрузкой из JSON-файла.
+pub struct HotPolicy {
+    path: PathBuf,
+    inner: RwLock<Arc<Policy>>,
+    content: Mutex<String>,
+    stop: AtomicBool,
+}
+
+impl HotPolicy {
+    /// Загружает файл; невалидный JSON — ошибка на старте.
+    pub fn new(path: impl AsRef<Path>) -> Result<Arc<Self>, PolicyError> {
+        let path = path.as_ref().to_path_buf();
+        let content = fs::read_to_string(&path)?;
+        let policy: Policy = serde_json::from_str(&content)?;
+        Ok(Arc::new(Self {
+            path,
+            inner: RwLock::new(Arc::new(policy)),
+            content: Mutex::new(content),
+            stop: AtomicBool::new(false),
+        }))
+    }
+
+    /// Свежий снапшот политики.
+    pub fn get(&self) -> Arc<Policy> {
+        self.inner.read().expect("policy lock").clone()
+    }
+
+    pub fn check(&self, agent: &str, action: &str, resource: &str) -> Decision {
+        self.get().check(agent, action, resource)
+    }
+
+    /// Перечитывает файл; true — политика заменена.
+    /// Ошибка чтения/парсинга не трогает работающую политику.
+    pub fn reload(&self) -> Result<bool, PolicyError> {
+        let content = fs::read_to_string(&self.path)?;
+        if content == *self.content.lock().expect("policy lock") {
+            return Ok(false);
+        }
+        let fresh: Policy = serde_json::from_str(&content)?;
+        *self.inner.write().expect("policy lock") = Arc::new(fresh);
+        *self.content.lock().expect("policy lock") = content;
+        Ok(true)
+    }
+
+    /// Фоновый опрос файла; остановка через stop().
+    pub fn spawn_watcher(self: &Arc<Self>, interval: Duration) -> std::thread::JoinHandle<()> {
+        let this = Arc::clone(self);
+        std::thread::spawn(move || {
+            while !this.stop.load(Ordering::Relaxed) {
+                std::thread::sleep(interval);
+                let _ = this.reload();
+            }
+        })
+    }
+
+    pub fn stop(&self) {
+        self.stop.store(true, Ordering::Relaxed);
+    }
+}
+
 /// Глоб: `*` — любая последовательность символов, остальное — литералы.
 fn glob(pattern: &str, text: &str) -> bool {
     let p: Vec<char> = pattern.chars().collect();
@@ -202,5 +270,59 @@ mod tests {
                 reason: "explicit deny rule".into()
             }
         );
+    }
+
+    fn temp_policy_path(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("tai-policy-{}-{tag}.json", std::process::id()))
+    }
+
+    const V1: &str = r#"{"rules":[{"effect":"allow","agent":"a","action":"act","resource":"x"}]}"#;
+    const V2: &str = r#"{"rules":[]}"#;
+
+    #[test]
+    fn hot_policy_reloads_changed_file() {
+        let path = temp_policy_path("reload");
+        std::fs::write(&path, V1).unwrap();
+        let hp = HotPolicy::new(&path).unwrap();
+        assert!(hp.check("a", "act", "x").is_allowed());
+
+        std::fs::write(&path, V2).unwrap();
+        assert!(hp.reload().unwrap());
+        assert!(!hp.check("a", "act", "x").is_allowed());
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn invalid_file_keeps_old_policy() {
+        let path = temp_policy_path("invalid");
+        std::fs::write(&path, V1).unwrap();
+        let hp = HotPolicy::new(&path).unwrap();
+
+        std::fs::write(&path, "not json").unwrap();
+        assert!(hp.reload().is_err());
+        assert!(hp.check("a", "act", "x").is_allowed());
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn watcher_picks_up_changes() {
+        let path = temp_policy_path("watcher");
+        std::fs::write(&path, V1).unwrap();
+        let hp = HotPolicy::new(&path).unwrap();
+        let watcher = hp.spawn_watcher(Duration::from_millis(20));
+
+        std::fs::write(&path, V2).unwrap();
+        // ждём, пока фоновый поток заметит изменение
+        for _ in 0..100 {
+            if !hp.check("a", "act", "x").is_allowed() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(!hp.check("a", "act", "x").is_allowed());
+
+        hp.stop();
+        watcher.join().unwrap();
+        std::fs::remove_file(&path).ok();
     }
 }
