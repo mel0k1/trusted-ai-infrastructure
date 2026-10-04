@@ -15,6 +15,8 @@ pub enum PolicyError {
     Io(#[from] std::io::Error),
     #[error("json: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("http: {0}")]
+    Http(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -119,26 +121,63 @@ impl Policy {
     }
 }
 
-/// Политика с горячей перезагрузкой из JSON-файла.
+/// Откуда берётся политика: локальный файл или HTTP(S)-эндпоинт.
+#[derive(Debug, Clone)]
+pub enum PolicySource {
+    File(PathBuf),
+    Http(String),
+}
+
+impl PolicySource {
+    fn fetch(&self) -> Result<String, PolicyError> {
+        match self {
+            Self::File(p) => Ok(fs::read_to_string(p)?),
+            Self::Http(url) => {
+                let resp = ureq::get(url)
+                    .timeout(Duration::from_secs(5))
+                    .call()
+                    .map_err(|e| PolicyError::Http(e.to_string()))?;
+                if resp.status() >= 300 {
+                    return Err(PolicyError::Http(format!("status {}", resp.status())));
+                }
+                Ok(resp.into_string()?)
+            }
+        }
+    }
+}
+
+/// Политика с горячей перезагрузкой: из файла или удалённого источника.
 pub struct HotPolicy {
-    path: PathBuf,
+    source: PolicySource,
     inner: RwLock<Arc<Policy>>,
     content: Mutex<String>,
     stop: AtomicBool,
 }
 
 impl HotPolicy {
-    /// Загружает файл; невалидный JSON — ошибка на старте.
+    /// Файл; невалидный JSON — ошибка на старте.
     pub fn new(path: impl AsRef<Path>) -> Result<Arc<Self>, PolicyError> {
-        let path = path.as_ref().to_path_buf();
-        let content = fs::read_to_string(&path)?;
+        Self::from_source(PolicySource::File(path.as_ref().to_path_buf()))
+    }
+
+    /// Удалённый источник: конфиг-сервер, S3-пресайн и т.п.
+    pub fn http(url: impl Into<String>) -> Result<Arc<Self>, PolicyError> {
+        Self::from_source(PolicySource::Http(url.into()))
+    }
+
+    pub fn from_source(source: PolicySource) -> Result<Arc<Self>, PolicyError> {
+        let content = source.fetch()?;
         let policy: Policy = serde_json::from_str(&content)?;
         Ok(Arc::new(Self {
-            path,
+            source,
             inner: RwLock::new(Arc::new(policy)),
             content: Mutex::new(content),
             stop: AtomicBool::new(false),
         }))
+    }
+
+    pub fn source(&self) -> &PolicySource {
+        &self.source
     }
 
     /// Свежий снапшот политики.
@@ -150,10 +189,10 @@ impl HotPolicy {
         self.get().check(agent, action, resource)
     }
 
-    /// Перечитывает файл; true — политика заменена.
-    /// Ошибка чтения/парсинга не трогает работающую политику.
+    /// Перечитывает источник; true — политика заменена.
+    /// Ошибка сети/парсинга не трогает работающую политику.
     pub fn reload(&self) -> Result<bool, PolicyError> {
-        let content = fs::read_to_string(&self.path)?;
+        let content = self.source.fetch()?;
         if content == *self.content.lock().expect("policy lock") {
             return Ok(false);
         }
@@ -276,6 +315,31 @@ mod tests {
         std::env::temp_dir().join(format!("tai-policy-{}-{tag}.json", std::process::id()))
     }
 
+    // локальный HTTP-сервер: выдаёт тела по очереди, по одному соединению на запрос
+    fn http_server(bodies: &[&str]) -> (String, std::thread::JoinHandle<()>) {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let bodies: Vec<String> = bodies.iter().map(|b| b.to_string()).collect();
+        let handle = std::thread::spawn(move || {
+            for body in &bodies {
+                let Ok((mut sock, _)) = listener.accept() else {
+                    break;
+                };
+                let mut buf = [0u8; 2048];
+                let _ = sock.read(&mut buf);
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = sock.write_all(resp.as_bytes());
+            }
+        });
+        (format!("http://{addr}/policy.json"), handle)
+    }
+
     const V1: &str = r#"{"rules":[{"effect":"allow","agent":"a","action":"act","resource":"x"}]}"#;
     const V2: &str = r#"{"rules":[]}"#;
 
@@ -324,5 +388,28 @@ mod tests {
         hp.stop();
         watcher.join().unwrap();
         std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn remote_policy_reload() {
+        let (url, server) = http_server(&[V1, V2]);
+        let hp = HotPolicy::http(url.as_str()).unwrap();
+        assert!(hp.check("a", "act", "x").is_allowed());
+
+        // второй запрос сервера отдаёт V2 — политика заменяется
+        assert!(hp.reload().unwrap());
+        assert!(!hp.check("a", "act", "x").is_allowed());
+        assert!(matches!(hp.source(), PolicySource::Http(_)));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn http_failure_keeps_old_policy() {
+        let (url, server) = http_server(&[V1]);
+        let hp = HotPolicy::http(url.as_str()).unwrap();
+        assert!(hp.check("a", "act", "x").is_allowed());
+        server.join().unwrap(); // сервер больше не отвечает
+        assert!(hp.reload().is_err());
+        assert!(hp.check("a", "act", "x").is_allowed());
     }
 }
